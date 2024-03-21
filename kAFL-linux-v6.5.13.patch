@@ -1,0 +1,1832 @@
+From 29d6bac4343be8455f0496e75b1d0242799a1633 Mon Sep 17 00:00:00 2001
+From: Kazurin Nanako <71819243+Kazurin-775@users.noreply.github.com>
+Date: Thu, 21 Mar 2024 11:24:51 +0800
+Subject: Apply kAFL patches
+
+---
+ arch/x86/include/asm/kvm-x86-ops.h |   2 +
+ arch/x86/include/asm/kvm_host.h    |   5 +
+ arch/x86/include/uapi/asm/kvm.h    |   6 +
+ arch/x86/kvm/Kconfig               |   6 +
+ arch/x86/kvm/Makefile              |   1 +
+ arch/x86/kvm/svm/svm.c             |  18 +
+ arch/x86/kvm/vmx/vmx.c             |  48 +-
+ arch/x86/kvm/vmx/vmx.h             |  15 +-
+ arch/x86/kvm/vmx/vmx_pt.c          | 865 +++++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/vmx_pt.h          |  21 +
+ arch/x86/kvm/x86.c                 |  84 +++
+ include/uapi/linux/kvm.h           |  46 ++
+ usermode_test/support_test.c       |  59 ++
+ usermode_test/test.c               | 351 ++++++++++++
+ 14 files changed, 1521 insertions(+), 6 deletions(-)
+ create mode 100644 arch/x86/kvm/vmx/vmx_pt.c
+ create mode 100644 arch/x86/kvm/vmx/vmx_pt.h
+ create mode 100644 usermode_test/support_test.c
+ create mode 100644 usermode_test/test.c
+
+diff --git a/arch/x86/include/asm/kvm-x86-ops.h b/arch/x86/include/asm/kvm-x86-ops.h
+index 9b419f0de713..81cc8f32a3a8 100644
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -135,6 +135,8 @@ KVM_X86_OP(msr_filter_changed)
+ KVM_X86_OP(complete_emulated_msr)
+ KVM_X86_OP(vcpu_deliver_sipi_vector)
+ KVM_X86_OP_OPTIONAL_RET0(vcpu_get_apicv_inhibit_reasons);
++KVM_X86_OP_OPTIONAL(setup_trace_fd)
++KVM_X86_OP_OPTIONAL(vmx_pt_enabled)
+ 
+ #undef KVM_X86_OP
+ #undef KVM_X86_OP_OPTIONAL
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 9bdbb1cc03d3..10913fe01e5a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1732,6 +1732,11 @@ struct kvm_x86_ops {
+ 	 * Returns vCPU specific APICv inhibit reasons
+ 	 */
+ 	unsigned long (*vcpu_get_apicv_inhibit_reasons)(struct kvm_vcpu *vcpu);
++
++#ifdef CONFIG_KVM_VMX_PT
++	int (*setup_trace_fd)(struct kvm_vcpu *vcpu);
++	int (*vmx_pt_enabled)(void);
++#endif
+ };
+ 
+ struct kvm_x86_nested_ops {
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 1a6a1f987949..8fb8c8a8bb0a 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -431,6 +431,12 @@ struct kvm_sync_regs {
+ 	struct kvm_vcpu_events events;
+ };
+ 
++/* vmx_pt */
++struct vmx_pt_filter_iprs {
++	__u64 a;
++	__u64 b;
++};
++
+ #define KVM_X86_QUIRK_LINT0_REENABLED		(1 << 0)
+ #define KVM_X86_QUIRK_CD_NW_CLEARED		(1 << 1)
+ #define KVM_X86_QUIRK_LAPIC_MMIO_HOLE		(1 << 2)
+diff --git a/arch/x86/kvm/Kconfig b/arch/x86/kvm/Kconfig
+index 89ca7f4c1464..bbd053b871e0 100644
+--- a/arch/x86/kvm/Kconfig
++++ b/arch/x86/kvm/Kconfig
+@@ -99,6 +99,12 @@ config X86_SGX_KVM
+ 
+ 	  If unsure, say N.
+ 
++config KVM_VMX_PT
++	bool "KVM extension for Intel Processor Trace"
++	depends on KVM_INTEL
++	help
++	  Provides support for Intel Processor Trace in vmx mode.
++
+ config KVM_AMD
+ 	tristate "KVM for AMD processors support"
+ 	depends on KVM
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index 80e3fe184d17..49d341d364a7 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -25,6 +25,7 @@ kvm-$(CONFIG_KVM_SMM)	+= smm.o
+ kvm-intel-y		+= vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o \
+ 			   vmx/hyperv.o vmx/nested.o vmx/posted_intr.o
+ kvm-intel-$(CONFIG_X86_SGX_KVM)	+= vmx/sgx.o
++kvm-intel-$(CONFIG_KVM_VMX_PT) += vmx/vmx_pt.o
+ 
+ kvm-amd-y		+= svm/svm.o svm/vmenter.o svm/pmu.o svm/nested.o svm/avic.o \
+ 			   svm/sev.o svm/hyperv.o
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index c8466bc64b87..cd77c8f5242f 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4798,6 +4798,19 @@ static int svm_vm_init(struct kvm *kvm)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_KVM_VMX_PT
++static int setup_trace_fd_stub(struct kvm_vcpu *vcpu)
++{
++	return -EINVAL;
++}
++
++static int vmx_pt_is_enabled(void)
++{
++	/* AMD CPUs do not support Intel PT */
++	return -EINVAL;
++}
++#endif
++
+ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.name = KBUILD_MODNAME,
+ 
+@@ -4929,6 +4942,11 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 
+ 	.vcpu_deliver_sipi_vector = svm_vcpu_deliver_sipi_vector,
+ 	.vcpu_get_apicv_inhibit_reasons = avic_vcpu_get_apicv_inhibit_reasons,
++
++#ifdef CONFIG_KVM_VMX_PT
++	.setup_trace_fd = setup_trace_fd_stub,
++	.vmx_pt_enabled = vmx_pt_is_enabled,
++#endif
+ };
+ 
+ /*
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 52af279f793d..b581ef27cdc4 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -68,6 +68,10 @@
+ #include "x86.h"
+ #include "smm.h"
+ 
++#ifdef CONFIG_KVM_VMX_PT
++#include "vmx_pt.h"
++#endif
++
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
+@@ -1011,7 +1015,7 @@ static __always_inline void add_atomic_switch_msr_special(struct vcpu_vmx *vmx,
+ 	vm_exit_controls_setbit(vmx, exit);
+ }
+ 
+-static void add_atomic_switch_msr(struct vcpu_vmx *vmx, unsigned msr,
++void add_atomic_switch_msr(struct vcpu_vmx *vmx, unsigned msr,
+ 				  u64 guest_val, u64 host_val, bool entry_only)
+ {
+ 	int i, j = 0;
+@@ -7272,6 +7276,10 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	unsigned long cr3, cr4;
+ 
++#ifdef CONFIG_KVM_VMX_PT
++	vmx_pt_vmentry(vmx->vmx_pt_config);
++#endif
++
+ 	/* Record the guest's net vcpu time for enforced NMI injections. */
+ 	if (unlikely(!enable_vnmi &&
+ 		     vmx->loaded_vmcs->soft_vnmi_blocked))
+@@ -7417,6 +7425,10 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	vmx_recover_nmi_blocking(vmx);
+ 	vmx_complete_interrupts(vmx);
+ 
++	#ifdef CONFIG_KVM_VMX_PT
++		vmx_pt_vmexit(vmx->vmx_pt_config);
++	#endif
++
+ 	if (is_guest_mode(vcpu))
+ 		return EXIT_FASTPATH_NONE;
+ 
+@@ -7432,6 +7444,11 @@ static void vmx_vcpu_free(struct kvm_vcpu *vcpu)
+ 	free_vpid(vmx->vpid);
+ 	nested_vmx_free_vcpu(vcpu);
+ 	free_loaded_vmcs(vmx->loaded_vmcs);
++
++#ifdef CONFIG_KVM_VMX_PT
++	/* free vmx_pt */
++	vmx_pt_destroy(vmx, &(vmx->vmx_pt_config));
++#endif
+ }
+ 
+ static int vmx_vcpu_create(struct kvm_vcpu *vcpu)
+@@ -7525,6 +7542,11 @@ static int vmx_vcpu_create(struct kvm_vcpu *vcpu)
+ 			goto free_vmcs;
+ 	}
+ 
++#ifdef CONFIG_KVM_VMX_PT
++	/* enable vmx_pt */
++	vmx_pt_setup(vmx, &(vmx->vmx_pt_config));
++#endif
++
+ 	if (vmx_can_use_ipiv(vcpu))
+ 		WRITE_ONCE(to_kvm_vmx(vcpu->kvm)->pid_table[vcpu->vcpu_id],
+ 			   __pa(&vmx->pi_desc) | PID_TABLE_ENTRY_VALID);
+@@ -8198,6 +8220,18 @@ static void vmx_vm_destroy(struct kvm *kvm)
+ 	free_pages((unsigned long)kvm_vmx->pid_table, vmx_get_pid_table_order(kvm));
+ }
+ 
++#ifdef CONFIG_KVM_VMX_PT
++static int vmx_pt_setup_fd(struct kvm_vcpu *vcpu)
++{
++	return vmx_pt_create_fd(to_vmx(vcpu)->vmx_pt_config);
++}
++
++static int vmx_pt_is_enabled(void)
++{
++	return vmx_pt_enabled();
++}
++#endif
++
+ static struct kvm_x86_ops vmx_x86_ops __initdata = {
+ 	.name = KBUILD_MODNAME,
+ 
+@@ -8338,6 +8372,11 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
+ 	.complete_emulated_msr = kvm_complete_insn_gp,
+ 
+ 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
++
++#ifdef CONFIG_KVM_VMX_PT
++	.setup_trace_fd = vmx_pt_setup_fd,
++	.vmx_pt_enabled = vmx_pt_is_enabled,
++#endif
+ };
+ 
+ static unsigned int vmx_handle_intel_pt_intr(void)
+@@ -8624,6 +8663,10 @@ static void __vmx_exit(void)
+ 	RCU_INIT_POINTER(crash_vmclear_loaded_vmcss, NULL);
+ 	synchronize_rcu();
+ 
++#ifdef CONFIG_KVM_VMX_PT
++	vmx_pt_exit();
++#endif
++
+ 	vmx_cleanup_l1d_flush();
+ }
+ 
+@@ -8694,6 +8737,9 @@ static int __init vmx_init(void)
+ 	if (r)
+ 		goto err_kvm_init;
+ 
++#ifdef CONFIG_KVM_VMX_PT
++	vmx_pt_init();
++#endif
+ 	return 0;
+ 
+ err_kvm_init:
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 32384ba38499..4e679413b86f 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -362,6 +362,10 @@ struct vcpu_vmx {
+ 		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+ 		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+ 	} shadow_msr_intercept;
++
++#ifdef CONFIG_KVM_VMX_PT
++	struct vcpu_vmx_pt *vmx_pt_config;
++#endif
+ };
+ 
+ struct kvm_vmx {
+@@ -413,6 +417,8 @@ unsigned int __vmx_vcpu_run_flags(struct vcpu_vmx *vmx);
+ bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs,
+ 		    unsigned int flags);
+ int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
++void add_atomic_switch_msr(struct vcpu_vmx *vmx, unsigned msr,
++				  u64 guest_val, u64 host_val, bool entry_only);
+ void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
+ 
+ void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr, int type);
+@@ -466,7 +472,8 @@ static inline u8 vmx_get_rvi(void)
+ }
+ 
+ #define __KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS				\
+-	(VM_ENTRY_LOAD_DEBUG_CONTROLS)
++	(VM_ENTRY_LOAD_DEBUG_CONTROLS |					\
++	 VM_ENTRY_PT_CONCEAL_PIP)
+ #ifdef CONFIG_X86_64
+ 	#define KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS			\
+ 		(__KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS |			\
+@@ -480,11 +487,11 @@ static inline u8 vmx_get_rvi(void)
+ 	 VM_ENTRY_LOAD_IA32_PAT |					\
+ 	 VM_ENTRY_LOAD_IA32_EFER |					\
+ 	 VM_ENTRY_LOAD_BNDCFGS |					\
+-	 VM_ENTRY_PT_CONCEAL_PIP |					\
+ 	 VM_ENTRY_LOAD_IA32_RTIT_CTL)
+ 
+ #define __KVM_REQUIRED_VMX_VM_EXIT_CONTROLS				\
+ 	(VM_EXIT_SAVE_DEBUG_CONTROLS |					\
++	 VM_EXIT_PT_CONCEAL_PIP |					\
+ 	 VM_EXIT_ACK_INTR_ON_EXIT)
+ #ifdef CONFIG_X86_64
+ 	#define KVM_REQUIRED_VMX_VM_EXIT_CONTROLS			\
+@@ -502,7 +509,6 @@ static inline u8 vmx_get_rvi(void)
+ 	       VM_EXIT_SAVE_VMX_PREEMPTION_TIMER |			\
+ 	       VM_EXIT_LOAD_IA32_EFER |					\
+ 	       VM_EXIT_CLEAR_BNDCFGS |					\
+-	       VM_EXIT_PT_CONCEAL_PIP |					\
+ 	       VM_EXIT_CLEAR_IA32_RTIT_CTL)
+ 
+ #define KVM_REQUIRED_VMX_PIN_BASED_VM_EXEC_CONTROL			\
+@@ -547,7 +553,7 @@ static inline u8 vmx_get_rvi(void)
+ 	 CPU_BASED_ACTIVATE_SECONDARY_CONTROLS |			\
+ 	 CPU_BASED_ACTIVATE_TERTIARY_CONTROLS)
+ 
+-#define KVM_REQUIRED_VMX_SECONDARY_VM_EXEC_CONTROL 0
++#define KVM_REQUIRED_VMX_SECONDARY_VM_EXEC_CONTROL (SECONDARY_EXEC_PT_CONCEAL_VMX)
+ #define KVM_OPTIONAL_VMX_SECONDARY_VM_EXEC_CONTROL			\
+ 	(SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |			\
+ 	 SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |			\
+@@ -569,7 +575,6 @@ static inline u8 vmx_get_rvi(void)
+ 	 SECONDARY_EXEC_TSC_SCALING |					\
+ 	 SECONDARY_EXEC_ENABLE_USR_WAIT_PAUSE |				\
+ 	 SECONDARY_EXEC_PT_USE_GPA |					\
+-	 SECONDARY_EXEC_PT_CONCEAL_VMX |				\
+ 	 SECONDARY_EXEC_ENABLE_VMFUNC |					\
+ 	 SECONDARY_EXEC_BUS_LOCK_DETECTION |				\
+ 	 SECONDARY_EXEC_NOTIFY_VM_EXITING |				\
+diff --git a/arch/x86/kvm/vmx/vmx_pt.c b/arch/x86/kvm/vmx/vmx_pt.c
+new file mode 100644
+index 000000000000..174b36a1889f
+--- /dev/null
++++ b/arch/x86/kvm/vmx/vmx_pt.c
+@@ -0,0 +1,865 @@
++/*
++ * Kernel AFL Intel PT / VMX Driver (KVM Extension)
++ * vmx_pt enables tracing for kvm vcpus.
++ * (c) Sergej Schumilo 2016 - sergej@schumilo.de
++ *
++ * Partially inspired by Andi Kleen's simple-pt kernel driver.
++ * (https://github.com/andikleen/simple-pt/)
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * Intel PT is specified in the Intel Architecture Instruction Set Extensions
++ * Programming Reference:
++ * http://software.intel.com/en-us/intel-isa-extensions
++ */
++
++#include "vmx.h"
++#include <linux/types.h>
++#include <asm/nmi.h>
++#include <asm/page.h>
++#include <linux/uaccess.h>
++#include <linux/slab.h>
++#include <linux/printk.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/kvm.h>
++#include <linux/anon_inodes.h>
++#include <linux/kvm.h>
++
++#define PRINT_FEATURE(msr_val, bit_val, str) \
++	if(msr_val & bit_val){ PRINT_INFO("\t [*] " str ":"); } \
++	else { PRINT_INFO("\t [ ] " str ":"); }
++
++#define HEXDUMP_RANGE 128
++
++#define MSR_IA32_PERF_GLOBAL_STATUS		0x0000038e
++#define TRACE_TOPA_PMI					0x80000000000000
++
++#define TOPA_MASK_OR_TABLE_OFFSET		0x00000000FFFFFF80
++#define TOPA_OUTPUT_OFFSET				0xFFFFFFFF00000000
++
++#define MSR_IA32_RTIT_OUTPUT_BASE		0x00000560
++#define MSR_IA32_RTIT_OUTPUT_MASK_PTRS	0x00000561
++#define MSR_IA32_RTIT_CTL				0x00000570
++#define MSR_IA32_RTIT_STATUS			0x00000571
++#define MSR_IA32_CR3_MATCH				0x00000572 
++#define MSR_IA32_ADDR0_START			0x00000580 
++#define MSR_IA32_ADDR0_END				0x00000581 
++#define MSR_IA32_ADDR1_START			0x00000582
++#define MSR_IA32_ADDR1_END				0x00000583 
++#define MSR_IA32_ADDR2_START			0x00000584 
++#define MSR_IA32_ADDR2_END				0x00000585
++
++#define TRACE_EN						BIT_ULL(0)
++#define CYC_EN							BIT_ULL(1)
++#define CTL_OS							BIT_ULL(2)
++#define CTL_USER						BIT_ULL(3)
++#define PT_ERROR						BIT_ULL(4)
++#define CR3_FILTER						BIT_ULL(7)
++#define TO_PA							BIT_ULL(8)
++#define MTC_EN							BIT_ULL(9)
++#define TSC_EN							BIT_ULL(10)
++#define DIS_RETC						BIT_ULL(11)
++#define BRANCH_EN						BIT_ULL(13)
++
++#define ADDR0_EN						BIT_ULL(32)
++#define ADDR1_EN						BIT_ULL(36)
++#define ADDR2_EN						BIT_ULL(40)
++#define ADDR3_EN						BIT_ULL(44)
++
++#define MTC_MASK						(0xf << 14)
++#define CYC_MASK						(0xf << 19)
++#define PSB_MASK						(0x0 << 24)
++#define ADDR0_SHIFT						32
++#define ADDR1_SHIFT						32
++#define ADDR0_MASK						(0xfULL << ADDR0_SHIFT)
++#define ADDR1_MASK						(0xfULL << ADDR1_SHIFT)
++#define TOPA_STOP						BIT_ULL(4)
++#define TOPA_INT						BIT_ULL(2)
++#define TOPA_END						BIT_ULL(0)
++#define TOPA_SIZE_SHIFT 				6
++
++#define NMI_HANDLER 					"pt_topa_pmi_handler"
++#define PRINT_INFO(msg)					printk(KERN_INFO "[VMX-PT] Info:\t%s\n",  (msg))
++#define PRINT_ERROR(msg)				printk(KERN_INFO "[VMX-PT] Error:\t%s\n", (msg))
++
++
++
++#define TOPA_MAIN_ORDER					7
++#define TOPA_FALLBACK_ORDER				0
++
++#define TOPA_MAIN_SIZE					((1 << TOPA_MAIN_ORDER)*(1 << PAGE_SHIFT))
++#define TOPA_FALLBACK_SIZE				((1 << TOPA_FALLBACK_ORDER)*(1 << PAGE_SHIFT))
++
++//#define DEBUG
++
++
++#define IF_VMX_PT_NOT_CONFIGURED(value, X) if(!value){X}
++
++#define HYPERCALL_HOOK_DISABLED_CR3		0x0000000000000000
++#define HYPERCALL_HOOK_DISABLED_RIP 	0xffffffffffffffff
++
++
++struct vcpu_vmx_pt {
++	/* hacky vcpu reverse reference */
++	struct vcpu_vmx *vmx;
++	
++	/* configuration */
++	u64 ia32_rtit_ctrl_msr;
++
++	/* IP-Filtering */
++	bool ia32_rtit_addr_configured[4][2];
++	u64 ia32_rtit_addr_0[2];
++	u64 ia32_rtit_addr_1[2];
++	u64 ia32_rtit_addr_2[2];
++	u64 ia32_rtit_addr_3[2];
++	
++	/* CR3-Filtering */
++	u64 ia32_rtit_cr3_match;
++	
++	/* ToPA */
++	u64 topa_pt_region;
++	u64 ia32_rtit_output_base;
++	u64 ia32_rtit_output_mask_ptrs;
++
++	void* topa_main_buf_virt_addr;
++	void* topa_fallback_buf_virt_addr;
++	void* topa_virt_addr;
++		
++	bool configured;
++	uint8_t cpu;
++	bool reset;
++}; 
++
++struct hypercall_hook_object
++{
++	u64 rip;
++    struct hlist_node node;
++};
++
++u8 enabled; 
++
++#ifdef DEBUG
++static inline void vmx_pt_dump_trace_data(struct vcpu_vmx_pt *vmx_pt);
++#endif
++void vmx_pt_enable(struct vcpu_vmx_pt *vmx_pt_config);
++void vmx_pt_disable(struct vcpu_vmx_pt *vmx_pt_config);
++
++
++/*===========================================================================* 
++ *                           vmx/pt userspace interface                      * 
++ *===========================================================================*/ 
++
++static int vmx_pt_release(struct inode *inode, struct file *filp);
++static long vmx_pt_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
++static int vmx_pt_mmap(struct file *filp, struct vm_area_struct *vma);
++
++static struct file_operations vmx_pt_fops = {
++	.release        = vmx_pt_release,
++	.unlocked_ioctl = vmx_pt_ioctl, 
++	.mmap           = vmx_pt_mmap,
++	.llseek         = noop_llseek,
++};
++
++static void prepare_topa(struct vcpu_vmx_pt *vmx_pt_config){
++	vmx_pt_config->ia32_rtit_output_mask_ptrs = 0x7fLL;
++}
++
++static int vmx_pt_get_data_size(struct vcpu_vmx_pt *vmx_pt){
++	/* get size of traced data */
++	u64 topa_base = READ_ONCE(vmx_pt->ia32_rtit_output_mask_ptrs);
++	//rdmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, topa_base);
++
++	if ((topa_base & TOPA_MASK_OR_TABLE_OFFSET)){ 
++		return (TOPA_MAIN_SIZE + ((topa_base & TOPA_OUTPUT_OFFSET)>>32));
++	}
++	return ((topa_base & TOPA_OUTPUT_OFFSET)>>32);
++}
++
++static int vmx_pt_get_data_size2(struct vcpu_vmx_pt *vmx_pt){
++	/* get size of traced data */
++	u64 topa_base = READ_ONCE(vmx_pt->ia32_rtit_output_mask_ptrs);
++	//rdmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, topa_base);
++		
++	if ((topa_base & TOPA_MASK_OR_TABLE_OFFSET)){ 
++		return (TOPA_MAIN_SIZE + ((topa_base & TOPA_OUTPUT_OFFSET)>>32));
++	}
++	return ((topa_base & TOPA_OUTPUT_OFFSET)>>32);
++}
++
++static int vmx_pt_check_overflow(struct vcpu_vmx_pt *vmx_pt){ 
++	/* check for upcoming ToPA entry overflow and / or raised PMI */
++	int bytes = vmx_pt_get_data_size2(vmx_pt);
++	if(bytes < TOPA_MAIN_SIZE){
++		return 0;
++	}
++	vmx_pt_get_data_size(vmx_pt);
++	return bytes;
++}
++
++static int vmx_pt_mmap(struct file *filp, struct vm_area_struct *vma)
++{	
++	struct vcpu_vmx_pt *vmx_pt_config = filp->private_data;
++	
++	/* refrence http://www.makelinux.net/books/lkd2/ch14lev1sec2 */                                     	
++	if ((vma->vm_end-vma->vm_start) > (TOPA_MAIN_SIZE+TOPA_FALLBACK_SIZE)){
++		return -EINVAL;
++	}
++	// VM_DENYWRITE has been removed by 8d0920bde5eb8ec7e567939b85e65a0596c8580d
++	vm_flags_set(vma, VM_READ | VM_SHARED);
++	// vma->vm_flags = (VM_READ | VM_SHARED);
++	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++
++	if ((vma->vm_end-vma->vm_start) > (TOPA_MAIN_SIZE)){
++		if(remap_pfn_range(vma, vma->vm_start, (__pa((void *)vmx_pt_config->topa_main_buf_virt_addr) >> PAGE_SHIFT), TOPA_MAIN_SIZE, vma->vm_page_prot)){
++			return -EAGAIN;                                               
++		}
++		if(remap_pfn_range(vma, vma->vm_start+TOPA_MAIN_SIZE, (__pa((void *)vmx_pt_config->topa_fallback_buf_virt_addr) >> PAGE_SHIFT), (vma->vm_end-vma->vm_start)-TOPA_MAIN_SIZE, vma->vm_page_prot)){
++			return -EAGAIN;                                               
++		}
++	} 
++	else {
++		if(remap_pfn_range(vma, vma->vm_start, (__pa((void *)vmx_pt_config->topa_main_buf_virt_addr) >> PAGE_SHIFT), (vma->vm_end-vma->vm_start), vma->vm_page_prot)){
++			return -EAGAIN;                                               
++		}
++	}
++	
++	return 0;   
++}
++
++
++static int vmx_pt_release(struct inode *inode, struct file *filp)
++{
++	/* do not free any resources until this vpcu is destroyed */
++#ifdef DEBUG
++	PRINT_INFO("file closed ...");
++#endif
++	return 0;
++}
++
++static long vmx_pt_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
++{
++
++	void __user *argp;
++	struct vmx_pt_filter_iprs filter_iprs;
++
++	/*
++	struct vmx_pt_hypercall_hook_regs hypercall_regs;
++	struct hypercall_hook_object* obj;
++	*/
++
++	struct vcpu_vmx_pt *vmx_pt_config = filp->private_data;
++	bool is_configured = vmx_pt_config->configured;
++	long r = -EINVAL;
++	
++	if (vmx_pt_config->reset){
++		vmx_pt_config->reset = false;
++		prepare_topa(vmx_pt_config);
++	}
++	
++	switch (ioctl) {
++		case KVM_VMX_PT_CONFIGURE_ADDR0:
++			if(!is_configured) {
++				argp = (void __user *)arg;		
++				if (!copy_from_user(&filter_iprs, argp, sizeof(filter_iprs))){
++#ifdef DEBUG
++					printk("Intel PT ADDR0 configured... (%llx / %llx)", filter_iprs.a, filter_iprs.b);
++#endif
++					vmx_pt_config->ia32_rtit_addr_0[0] = filter_iprs.a;
++					vmx_pt_config->ia32_rtit_addr_0[1] = filter_iprs.b;
++					vmx_pt_config->ia32_rtit_addr_configured[0][0] = true;
++					vmx_pt_config->ia32_rtit_addr_configured[0][1] = true;
++					r = 0;
++				}
++			}
++			break;
++		case KVM_VMX_PT_CONFIGURE_ADDR1:
++			if(!is_configured) {
++				argp = (void __user *)arg;		
++				if (!copy_from_user(&filter_iprs, argp, sizeof(filter_iprs))){
++					vmx_pt_config->ia32_rtit_addr_1[0] = filter_iprs.a;
++					vmx_pt_config->ia32_rtit_addr_1[1] = filter_iprs.b;
++					vmx_pt_config->ia32_rtit_addr_configured[1][0] = true;
++					vmx_pt_config->ia32_rtit_addr_configured[1][1] = true;
++					r = 0;
++				}
++			}
++			break;
++		case KVM_VMX_PT_CONFIGURE_ADDR2:
++			if(!is_configured) {
++				argp = (void __user *)arg;		
++				if (!copy_from_user(&filter_iprs, argp, sizeof(filter_iprs))){
++					vmx_pt_config->ia32_rtit_addr_2[0] = filter_iprs.a;
++					vmx_pt_config->ia32_rtit_addr_2[1] = filter_iprs.b;
++					vmx_pt_config->ia32_rtit_addr_configured[2][0] = true;
++					vmx_pt_config->ia32_rtit_addr_configured[2][1] = true;
++					r = 0;
++				}
++			}
++			break;
++		case KVM_VMX_PT_CONFIGURE_ADDR3:
++			if(!is_configured) {
++				argp = (void __user *)arg;		
++				if (!copy_from_user(&filter_iprs, argp, sizeof(filter_iprs))){
++					vmx_pt_config->ia32_rtit_addr_3[0] = filter_iprs.a;
++					vmx_pt_config->ia32_rtit_addr_3[1] = filter_iprs.b;
++					vmx_pt_config->ia32_rtit_addr_configured[3][0] = true;
++					vmx_pt_config->ia32_rtit_addr_configured[3][1] = true;
++					r = 0;
++				}
++			}
++			break;	
++		case KVM_VMX_PT_ENABLE_ADDR0:
++			if((!is_configured) && vmx_pt_config->ia32_rtit_addr_configured[0][0] && vmx_pt_config->ia32_rtit_addr_configured[0][1]){
++#ifdef DEBUG
++				printk("Intel PT ADDR0 enabled...");
++#endif
++				vmx_pt_config->ia32_rtit_ctrl_msr |= ADDR0_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_ENABLE_ADDR1:
++			if((!is_configured) && vmx_pt_config->ia32_rtit_addr_configured[1][0] && vmx_pt_config->ia32_rtit_addr_configured[1][1]){
++				vmx_pt_config->ia32_rtit_ctrl_msr |= ADDR1_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_ENABLE_ADDR2:
++			if((!is_configured) && vmx_pt_config->ia32_rtit_addr_configured[2][0] && vmx_pt_config->ia32_rtit_addr_configured[2][1]){
++				vmx_pt_config->ia32_rtit_ctrl_msr |= ADDR2_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_ENABLE_ADDR3:
++			if((!is_configured) && vmx_pt_config->ia32_rtit_addr_configured[3][0] && vmx_pt_config->ia32_rtit_addr_configured[3][1]){
++				vmx_pt_config->ia32_rtit_ctrl_msr |= ADDR3_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_DISABLE_ADDR0:
++			if((!is_configured) && (vmx_pt_config->ia32_rtit_ctrl_msr & ADDR0_EN)){
++				vmx_pt_config->ia32_rtit_ctrl_msr ^= ADDR0_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_DISABLE_ADDR1:
++			if((!is_configured) && (vmx_pt_config->ia32_rtit_ctrl_msr & ADDR1_EN)){
++				vmx_pt_config->ia32_rtit_ctrl_msr ^= ADDR1_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_DISABLE_ADDR2:
++			if((!is_configured) && (vmx_pt_config->ia32_rtit_ctrl_msr & ADDR2_EN)){
++				vmx_pt_config->ia32_rtit_ctrl_msr ^= ADDR2_EN;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_DISABLE_ADDR3:
++			if((!is_configured) && (vmx_pt_config->ia32_rtit_ctrl_msr & ADDR3_EN)){
++				vmx_pt_config->ia32_rtit_ctrl_msr ^= ADDR3_EN;
++				r = 0;
++			}
++			break;
++			
++		case KVM_VMX_PT_CONFIGURE_CR3:
++#ifdef DEBUG
++			PRINT_INFO("KVM_VMX_PT_CONFIGURE_CR3...");
++#endif
++			if(!is_configured) {
++				vmx_pt_config->ia32_rtit_cr3_match = arg; 
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_ENABLE_CR3:
++			/* we just assume that cr3=NULL is invalid... */
++			if((!is_configured) && vmx_pt_config->ia32_rtit_cr3_match){
++				vmx_pt_config->ia32_rtit_ctrl_msr |= CR3_FILTER;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_DISABLE_CR3:
++			if((!is_configured) && (vmx_pt_config->ia32_rtit_ctrl_msr & CR3_FILTER)){
++				vmx_pt_config->ia32_rtit_ctrl_msr ^= CR3_FILTER;
++				r = 0;
++			}
++			break;
++		case KVM_VMX_PT_ENABLE:
++			if(!is_configured) {
++				//PRINT_INFO("Intel PT enabled...");
++				vmx_pt_enable(vmx_pt_config);
++			}
++			r = 0;
++			break;
++		case KVM_VMX_PT_DISABLE:
++			if(vmx_pt_config->configured) {
++				//PRINT_INFO("Intel PT disabled...");
++				r = vmx_pt_get_data_size(vmx_pt_config);
++				vmx_pt_disable(vmx_pt_config);
++				vmx_pt_config->reset = true;
++
++			}
++			else{
++				r = -EINVAL;
++			}
++			break;
++		case KVM_VMX_PT_CHECK_TOPA_OVERFLOW:
++			r = vmx_pt_check_overflow(vmx_pt_config);
++			if(r){
++				vmx_pt_config->reset = true;
++#ifdef DEBUG
++				printk("KVM_VMX_PT_CHECK_TOPA_OVERFLOW %ld\n", r);
++#endif
++			}
++			break;
++		case KVM_VMX_PT_GET_TOPA_SIZE:
++			r = (TOPA_MAIN_SIZE + TOPA_FALLBACK_SIZE);
++			break;
++	}
++	return r;
++}
++
++int vmx_pt_create_fd(struct vcpu_vmx_pt *vmx_pt_config){
++	if (enabled){
++		return anon_inode_getfd("vmx-pt", &vmx_pt_fops, vmx_pt_config, O_RDWR | O_CLOEXEC); 
++	}
++	else {
++		return 0;
++	}
++}
++
++/*===========================================================================* 
++
++ *                          vmx/pt vcpu entry/exit                           * 
++ *===========================================================================*/ 
++
++static inline void vmx_pt_reconfigure_cpu(struct vcpu_vmx_pt *vmx_pt){ 
++	
++	uint64_t status;
++	rdmsrl(MSR_IA32_RTIT_STATUS, status);
++	if ((status & BIT_ULL(5))){
++			PRINT_INFO("Intel PT error detected...");
++			status ^= BIT_ULL(5);
++			wrmsrl(MSR_IA32_RTIT_STATUS, status);
++	}
++	
++	/* set PacketByteBnt = 0 */
++	status &= 0xFFFE0000FFFFFFFF;
++	wrmsrl(MSR_IA32_RTIT_STATUS, status);
++		
++	/* reconfigure CR3-Filtering */
++	wrmsrl(MSR_IA32_CR3_MATCH, vmx_pt->ia32_rtit_cr3_match);
++	
++	/* reconfigure IP-Filtering  */
++	wrmsrl(MSR_IA32_ADDR0_START, vmx_pt->ia32_rtit_addr_0[0]); 
++	wrmsrl(MSR_IA32_ADDR0_END,   vmx_pt->ia32_rtit_addr_0[1]); 
++	wrmsrl(MSR_IA32_ADDR1_START, vmx_pt->ia32_rtit_addr_1[0]);
++	wrmsrl(MSR_IA32_ADDR1_END,   vmx_pt->ia32_rtit_addr_1[1]); 
++	wrmsrl(MSR_IA32_ADDR2_START, vmx_pt->ia32_rtit_addr_2[0]);
++	wrmsrl(MSR_IA32_ADDR2_END,   vmx_pt->ia32_rtit_addr_2[1]);
++	
++	/* reconfigure ToPA */
++	wrmsrl(MSR_IA32_RTIT_OUTPUT_BASE, vmx_pt->ia32_rtit_output_base);
++	wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, vmx_pt->ia32_rtit_output_mask_ptrs);
++	
++
++}
++
++#ifdef DEBUG
++static inline void vmx_pt_dump_trace_data(struct vcpu_vmx_pt *vmx_pt){
++	int i;
++	u64 cksum = 0;
++	PRINT_INFO("Intel PT trace data:");
++	print_hex_dump(KERN_DEBUG, "ToPA data: ", DUMP_PREFIX_OFFSET, 16, 8, vmx_pt->topa_main_buf_virt_addr, HEXDUMP_RANGE, true);
++	
++	for(i = 0; i < HEXDUMP_RANGE; i++){
++		cksum += ((u8*)vmx_pt->topa_main_buf_virt_addr)[i];
++	}
++	printk("CHECKSUM: %lld\n", cksum);
++}
++#endif
++
++static inline void vmx_pt_check_error(void){	
++	u64 status;
++	rdmsrl(MSR_IA32_RTIT_STATUS, status);
++	if (status == 0x20){
++		PRINT_ERROR("MSR_IA32_RTIT_STATUS -> STOPPED");
++	}
++	
++	if(status == 0x10){
++		PRINT_ERROR("MSR_IA32_RTIT_STATUS -> ERROR");
++	}
++}
++
++void vmx_pt_vmentry(struct vcpu_vmx_pt *vmx_pt){
++	uint64_t data;
++	rdmsrl(MSR_IA32_RTIT_STATUS, data);
++	if ((data & BIT(3))){
++		printk("ERROR: Tracing is on during root-operations!\n");
++	}
++	
++	if (enabled && vmx_pt && vmx_pt->configured){
++			if (vmx_pt->reset){
++				vmx_pt->reset = false;
++				prepare_topa(vmx_pt);
++			}
++			vmx_pt->cpu = raw_smp_processor_id();
++			//printk("vmentry on cpu %d\n", raw_smp_processor_id());
++			vmx_pt_reconfigure_cpu(vmx_pt);
++			/*if (vmx_pt_check_overflow(vmx_pt)){
++				// reconfigure ToPA 
++				vmx_pt->ia32_rtit_output_mask_ptrs = 0x7fLL;
++				wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, vmx_pt->ia32_rtit_output_mask_ptrs);
++			}
++			*/
++	}
++}
++
++void vmx_pt_vmexit(struct vcpu_vmx_pt *vmx_pt){
++	u64 topa_base, topa_mask_ptrs;
++	uint64_t data;
++	rdmsrl(MSR_IA32_RTIT_STATUS, data);
++	if ((data & BIT(3))){
++		printk("ERROR: Tracing is on during root-operations!\n");
++	}
++	
++	if (enabled && (vmx_pt != NULL)){
++		if (vmx_pt->configured){
++			if (vmx_pt->cpu != raw_smp_processor_id()){
++				printk("CPU ERROR! %d != %d", vmx_pt->cpu, raw_smp_processor_id());
++			}
++			vmx_pt_check_error();
++			wmb();
++			rdmsrl(MSR_IA32_RTIT_OUTPUT_BASE, topa_base);
++			rdmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, topa_mask_ptrs);
++			WRITE_ONCE(vmx_pt->ia32_rtit_output_base, topa_base);
++			WRITE_ONCE(vmx_pt->ia32_rtit_output_mask_ptrs, topa_mask_ptrs);
++
++		}
++	}
++}
++
++/*===========================================================================*
++ *                               vmx/pt vcpu setup                           *
++ *===========================================================================*/
++
++static int vmx_pt_setup_topa(struct vcpu_vmx_pt *vmx_pt)
++{
++	unsigned long main_buffer, fallback_buffer;
++	u64 *topa;
++	int n;
++		
++	main_buffer = __get_free_pages(GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO, TOPA_MAIN_ORDER);
++	if (!main_buffer) {
++		PRINT_ERROR("Cannot allocate main ToPA buffer!");
++		return -ENOMEM;
++	}	
++	
++	fallback_buffer = __get_free_pages(GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO, TOPA_FALLBACK_ORDER);
++	if (!fallback_buffer) {
++		PRINT_ERROR("Cannot allocate fallback ToPA buffer!");
++		goto free_topa_buffer1;
++	}
++
++	topa = (u64 *)__get_free_page(GFP_KERNEL|__GFP_ZERO);
++	if (!topa) {
++		PRINT_ERROR("Cannot allocate ToPA table!");
++		goto free_topa_buffer2;
++	}
++
++	memset((u64 *)main_buffer, 0x0, TOPA_MAIN_SIZE);
++	memset((u64 *)fallback_buffer, 0x0, TOPA_FALLBACK_SIZE);
++
++	/* VMX / PT ToPA
++	*  +---------------------------------------+
++	*  |ToPA Entry_A (TOPA_ORDER/2, INT)       | <------------------------\ (1. start tracing, send LVT PMI if this region is full)
++	*  |ToPA Entry_B (TOPA_ORDER/2) [Fallback] | ptr to intial ToPA entry | (2. fallback area)
++	*  |Topa Entry_C (PTR, END)                |--------------------------/ (3. force tracing stop, ptr to Entry_A)
++	*  +---------------------------------------+
++	*/
++	
++	n = 0;
++	topa[n++] = (u64)__pa(main_buffer)	| (TOPA_MAIN_ORDER << TOPA_SIZE_SHIFT) | TOPA_INT;
++	topa[n++] = (u64)__pa(fallback_buffer)	| (TOPA_FALLBACK_ORDER << TOPA_SIZE_SHIFT);
++	topa[n] =   (u64)__pa(topa)		| TOPA_END;
++		
++	vmx_pt->topa_pt_region = (u64)topa;
++	vmx_pt->ia32_rtit_output_base = __pa(topa);
++	vmx_pt->ia32_rtit_output_mask_ptrs = 0x7fLL;	
++	vmx_pt->topa_main_buf_virt_addr = (void*)main_buffer;
++	vmx_pt->topa_fallback_buf_virt_addr = (void*)fallback_buffer;
++	vmx_pt->topa_virt_addr = (void*)topa;
++	
++	wrmsrl(MSR_IA32_RTIT_OUTPUT_BASE, vmx_pt->ia32_rtit_output_base);
++	wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, vmx_pt->ia32_rtit_output_mask_ptrs);
++	
++	prepare_topa(vmx_pt);
++	vmx_pt->reset = true;
++	
++	return 0;
++	
++	free_topa_buffer2:
++		free_pages(fallback_buffer, TOPA_FALLBACK_ORDER);
++	free_topa_buffer1:
++		free_pages(main_buffer, TOPA_MAIN_ORDER);
++	return -ENOMEM;
++}
++ 
++#ifdef DEBUG
++static void vmx_pt_print_msrs(u64 ia32_rtit_ctrl_msr){
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, TRACE_EN,		"TRACE_EN");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, CTL_OS,		"CTL_OS");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, CTL_USER,		"CTL_USER");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, TO_PA,		"TO_PA");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, BRANCH_EN,		"BRANCH_EN");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, CR3_FILTER, 		"CR3_FILTER");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, MTC_EN, 		"MTC_EN");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, TSC_EN, 		"TSC_EN");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, ADDR0_EN,		"ADDR0_CFG");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, ADDR1_EN,		"ADDR1_CFG");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, ADDR2_EN,		"ADDR2_CFG");
++	PRINT_FEATURE(ia32_rtit_ctrl_msr, ADDR3_EN,		"ADDR3_CFG");
++}
++#endif
++		
++static inline void vmx_pt_setup_msrs(struct vcpu_vmx_pt *vmx_pt){
++	/* Disable: MTCEn, TSCEn, DisRTC, CYCEn, TraceEN
++	 * Enable:  OS, CR3Filtering, ToPA, BranchEN
++	 */ 
++	int i;
++	
++	//vmx_pt->ia32_rtit_ctrl_msr = 0ULL;
++	WRITE_ONCE(vmx_pt->ia32_rtit_ctrl_msr, (!TRACE_EN) | CTL_OS | TO_PA | BRANCH_EN | DIS_RETC | PSB_MASK);
++	//vmx_pt->ia32_rtit_ctrl_msr = (!TRACE_EN) | CTL_OS | CTL_USER | TO_PA | BRANCH_EN | DIS_RETC | PSB_MASK;
++	
++	for (i = 0; i < 4; i++){
++		WRITE_ONCE(vmx_pt->ia32_rtit_addr_configured[i][0], false);
++		WRITE_ONCE(vmx_pt->ia32_rtit_addr_configured[i][1], false);	
++	}
++
++	vmx_pt->ia32_rtit_addr_0[0] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_0[1] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_1[0] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_1[1] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_2[0] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_2[1] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_3[0] = (u64)NULL;
++	vmx_pt->ia32_rtit_addr_3[1] = (u64)NULL;
++	
++	vmx_pt->ia32_rtit_cr3_match = (u64)NULL;
++}
++
++static inline void vmx_pt_setup_vmx_autoload_msr(struct vcpu_vmx_pt *vmx_pt_config, bool enable_vmx_pt){
++	u64 guest_val, host_val;
++	host_val = READ_ONCE(vmx_pt_config->ia32_rtit_ctrl_msr);
++	
++	/* check and unset IA32_RTIT_CTL_MSR.TraceEn for host msr */
++	if (host_val & TRACE_EN){
++		host_val ^= TRACE_EN;
++	}
++
++	/* set IA32_RTIT_CTL_MSR.TraceEn for guest msr (if intended) */
++	guest_val = host_val;
++	if(enable_vmx_pt)
++		guest_val |= TRACE_EN;
++	
++#ifdef DEBUG
++	printk("GUEST: %llx\n", guest_val);
++	PRINT_INFO("MSR_IA32_RTIT_CTL guest features:");
++	vmx_pt_print_msrs(guest_val);
++	PRINT_INFO("MSR_IA32_RTIT_CTL host features:");
++	vmx_pt_print_msrs(host_val);
++#endif
++	add_atomic_switch_msr(vmx_pt_config->vmx, MSR_IA32_RTIT_CTL, guest_val, host_val, false);
++}
++
++void vmx_pt_enable(struct vcpu_vmx_pt *vmx_pt_config){
++	if (!vmx_pt_config->configured){
++		vmx_pt_config->configured = true;
++		vmx_pt_setup_vmx_autoload_msr(vmx_pt_config, true);
++	}
++}
++
++void vmx_pt_disable(struct vcpu_vmx_pt *vmx_pt_config){
++	if (vmx_pt_config->configured){
++		vmx_pt_config->configured = false;
++		vmx_pt_setup_vmx_autoload_msr(vmx_pt_config, false);
++		wmb();
++		vmx_pt_config->ia32_rtit_output_mask_ptrs = 0x7fLL;
++		wrmsrl(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, vmx_pt_config->ia32_rtit_output_mask_ptrs);
++	}
++}
++
++int vmx_pt_setup(struct vcpu_vmx *vmx, struct vcpu_vmx_pt **vmx_pt_config){ 
++	int ret_val;
++	if (enabled){
++		ret_val = 0;
++		*vmx_pt_config = kmalloc(sizeof(struct vcpu_vmx_pt), GFP_KERNEL);
++		(*vmx_pt_config)->vmx = vmx;
++		(*vmx_pt_config)->configured = false;
++
++		vmx_pt_setup_msrs(*vmx_pt_config);
++		ret_val = vmx_pt_setup_topa(*vmx_pt_config);
++		if (ret_val)
++			goto setup_fail1;
++#ifdef DEBUG
++		PRINT_INFO("Setup finished...");
++#endif
++		return 0;
++		
++		setup_fail1:
++			PRINT_INFO("ToPA setup failed...");
++			
++		kfree(*vmx_pt_config);
++		*vmx_pt_config = NULL;
++		return ret_val;
++	}
++	*vmx_pt_config = NULL;
++	return 0;
++}
++
++void vmx_pt_destroy(struct vcpu_vmx *vmx, struct vcpu_vmx_pt **vmx_pt_config){ 
++	u64 value;
++	rdmsrl(MSR_IA32_RTIT_CTL, value);
++#ifdef DEBUG
++	vmx_pt_print_msrs(value);
++	vmx_pt_dump_trace_data(*vmx_pt_config);
++#endif
++
++	free_pages((u64)(*vmx_pt_config)->topa_main_buf_virt_addr, TOPA_MAIN_ORDER);
++	free_pages((u64)(*vmx_pt_config)->topa_fallback_buf_virt_addr, TOPA_FALLBACK_ORDER);
++	free_page((u64)(*vmx_pt_config)->topa_virt_addr);
++
++	kfree(*vmx_pt_config);
++	*vmx_pt_config = NULL;
++#ifdef DEBUG
++	PRINT_INFO("Struct freed...");
++#endif
++}
++
++/*===========================================================================*
++ *			      vmx/pt initialization			     * 
++ *===========================================================================*/
++
++static int pt_topa_pmi_handler(unsigned int val, struct pt_regs *regs)
++{
++	/*
++	 * Since this pmi results in vmexit during guest-mode execution and it is 
++	 * possible to detect a nearly overflowed topa region later during runtime
++	 * (by reading msrs), this nmi handler just 'handles' the pmi without doing something. 
++	 * Otherwise, since this pmi is not 'precise', it might be executed after a task switch to another vcpu.
++	 * This might result in a racy condition...
++	 */
++	u64 msr_value;
++	rdmsrl(MSR_IA32_PERF_GLOBAL_STATUS, msr_value);
++	if (msr_value & TRACE_TOPA_PMI){
++#ifdef DEBUG
++		printk("CPU %d: <Intel PT PMI>\n", raw_smp_processor_id());
++#endif
++		return NMI_HANDLED;
++	}
++	//printk("NO TOPA PMI @ CPU %d: <Intel PT PMI> (%llx)\n", raw_smp_processor_id(), msr_value);
++	return NMI_DONE;
++}
++
++static int setup_vmx_pt_pmi_handler(void){
++#ifdef DEBUG
++	/* must be 0x400 -> NMI */
++	printk("APIC_LVTPC: %lx\n", (long unsigned int)apic_read(APIC_LVTPC));
++#endif
++	
++	if (register_nmi_handler(NMI_LOCAL, pt_topa_pmi_handler, 0, NMI_HANDLER)){
++		//printk("%s: 1\n", __func__);
++		PRINT_ERROR("LVT PMI handler registration failed!");
++		return 1;
++	}
++	//printk("%s: 0\n", __func__);
++	PRINT_INFO("LVT PMI handler registrated!");
++	return 0;
++}
++
++static void disable_nmi_handler(void){
++	unregister_nmi_handler(NMI_LOCAL, NMI_HANDLER);
++	// synchronize_sched();
++	synchronize_rcu();
++	PRINT_INFO("LVT PMI handler disabled!");
++}
++
++static int vmx_pt_check_support(void){
++	/* 
++	 *  Let's assume that all presented logical cpu cores provide the following features:
++	 *  - Intel PT
++	 *	- VMX supported tracing
++	 *	- ToPA support for multiple reagions (otherwise it is hard to prevent ToPA overflows)
++	 *	- Payloads are stored as IP not as LIP
++	 *	- ADDRn_CFG = 3
++	 */
++	unsigned a, b, c, d;
++	//unsigned a1, b1, c1, d1;
++	u64 msr_value;
++
++	cpuid(0, &a, &b, &c, &d);
++	if (a < 0x14) {
++		PRINT_ERROR("Not enough CPUID support for PT!");
++		return -EIO;
++	}
++	cpuid_count(0x07, 0, &a, &b, &c, &d);
++	if ((b & BIT(25)) == 0) {
++		PRINT_ERROR("No PT support!");
++		return -EIO;
++	}
++	cpuid_count(0x14, 0, &a, &b, &c, &d);
++	if (!(c & BIT(0))) {
++		PRINT_ERROR("No ToPA support!");
++		return -EIO;
++	}
++
++	if ((c & BIT(31))){
++		PRINT_ERROR("IP Payloads are LIP!");
++		return -EIO;
++	}
++
++	if (!(c & BIT(1))) {
++		PRINT_ERROR("Only one ToPA block supported!");  
++		return -EIO;
++	}
++
++	if (!(b & BIT(2))) {   
++		PRINT_ERROR("No IP-Filtering support!");  
++		return -EIO;
++	}
++
++	rdmsrl(MSR_IA32_VMX_MISC, msr_value);
++	if (!(msr_value & BIT(14))){
++		PRINT_ERROR("VMX operations are not supported in Intel PT tracing mode!");
++		return -EIO; 
++	}
++
++	/* todo check ADDRn_CFG support */	
++	return 0;
++}
++
++int vmx_pt_enabled(void){
++	return (int)enabled; 
++}
++
++void vmx_pt_init(void){
++	enabled = !vmx_pt_check_support();
++	if (enabled){
++		PRINT_INFO("CPU is supported!");
++		setup_vmx_pt_pmi_handler();
++	}
++}
++
++void vmx_pt_exit(void){
++	if (enabled){
++		disable_nmi_handler();
++	}
++}
+diff --git a/arch/x86/kvm/vmx/vmx_pt.h b/arch/x86/kvm/vmx/vmx_pt.h
+new file mode 100644
+index 000000000000..aa16b1395a63
+--- /dev/null
++++ b/arch/x86/kvm/vmx/vmx_pt.h
+@@ -0,0 +1,21 @@
++#ifndef __VMX_PT_H__
++#define __VMX_PT_H__
++
++#include "vmx.h"
++
++struct vcpu_vmx_pt;
++
++int vmx_pt_create_fd(struct vcpu_vmx_pt *vmx_pt_config);
++
++void vmx_pt_vmentry(struct vcpu_vmx_pt *vmx_pt);
++void vmx_pt_vmexit(struct vcpu_vmx_pt *vmx_pt);
++
++int vmx_pt_setup(struct vcpu_vmx *vmx, struct vcpu_vmx_pt **vmx_pt_config);
++void vmx_pt_destroy(struct vcpu_vmx *vmx, struct vcpu_vmx_pt **vmx_pt_config);
++
++void vmx_pt_init(void);
++void vmx_pt_exit(void);
++
++int vmx_pt_enabled(void);
++
++#endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index a5c8a01f7e7e..485883ce9373 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4788,6 +4788,12 @@ long kvm_arch_dev_ioctl(struct file *filp,
+ 		r = kvm_x86_dev_has_attr(&attr);
+ 		break;
+ 	}
++#ifdef CONFIG_KVM_VMX_PT
++	case KVM_VMX_PT_SUPPORTED: {
++		r = static_call(kvm_x86_vmx_pt_enabled)();
++		break;
++	}
++#endif
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+@@ -6077,6 +6083,12 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 	case KVM_SET_DEVICE_ATTR:
+ 		r = kvm_vcpu_ioctl_device_attr(vcpu, ioctl, argp);
+ 		break;
++#ifdef CONFIG_KVM_VMX_PT
++	case KVM_VMX_PT_SETUP_FD: {
++		r = static_call(kvm_x86_setup_trace_fd)(vcpu);
++		break;
++	}
++#endif
+ 	default:
+ 		r = -EINVAL;
+ 	}
+@@ -9851,6 +9863,63 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (static_call(kvm_x86_get_cpl)(vcpu) != 0) {
++		/* kAFL Hypercall interface */
++		#ifdef CONFIG_KVM_VMX_PT
++		if (kvm_register_read(vcpu, VCPU_REGS_RAX) == HYPERCALL_KAFL_RAX_ID){
++			ret = 0;
++			switch(kvm_register_read(vcpu, VCPU_REGS_RBX)){
++				case 0:  /* KAFL_GUEST_ACQUIRE */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_ACQUIRE;
++					break;
++				case 1:  /* KAFL_GUEST_GET_PAYLOAD */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_GET_PAYLOAD;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX);
++					break;
++				case 2:  /* KAFL_GUEST_GET_PROGRAM */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_GET_PROGRAM;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX);
++					break;
++				case 3: /* KAFL_GUEST_GET_ARGV */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_GET_ARGV;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX);
++					break;
++				case 4: /* KAFL_GUEST_RELEASE */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_RELEASE;
++					break;
++				case 5: /* KAFL_GUEST_SUBMIT_CR3 */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_SUBMIT_CR3;
++					vcpu->run->hypercall.args[0] = kvm_read_cr3(vcpu);
++					break;
++				case 6: /* KAFL_GUEST_PANIC */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_SUBMIT_PANIC;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX); 
++					break;
++				case 7: /* KAFL_GUEST_KASAN */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_SUBMIT_KASAN;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX); 
++					break;
++				case 10: /* LOCK */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_LOCK;
++					break;
++				case 11: /* INFO */    
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_INFO;
++                    vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX);
++					break;
++				case 12: /* KAFL_GUEST_NEXT_PAYLOAD */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_NEXT_PAYLOAD;
++					break;
++				case 13: /* KAFL_GUEST_DEBUG */
++					vcpu->run->exit_reason = KVM_EXIT_KAFL_DEBUG;
++					vcpu->run->hypercall.args[0] = kvm_register_read(vcpu, VCPU_REGS_RCX);
++					break;
++				default:
++					ret = -KVM_EPERM;
++					break;
++			}
++			goto out;
++		}
++		#endif
++
+ 		ret = -KVM_EPERM;
+ 		goto out;
+ 	}
+@@ -9913,6 +9982,21 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.complete_userspace_io = complete_hypercall_exit;
+ 		return 0;
+ 	}
++	case HYPERCALL_KAFL_RAX_ID: {
++		ret = 0;
++		switch(kvm_register_read(vcpu, VCPU_REGS_RBX)){
++			case 8: /* PANIC */
++				vcpu->run->exit_reason = KVM_EXIT_KAFL_PANIC;
++				break;
++			case 9: /* KASAN */
++				vcpu->run->exit_reason = KVM_EXIT_KAFL_KASAN;
++				break;
++			default:
++				ret = -KVM_EPERM;
++				break;
++		}
++		goto out;
++	}
+ 	default:
+ 		ret = -KVM_ENOSYS;
+ 		break;
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index f089ab290978..42f749c034c7 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -265,6 +265,22 @@ struct kvm_xen_exit {
+ #define KVM_EXIT_RISCV_CSR        36
+ #define KVM_EXIT_NOTIFY           37
+ 
++#define HYPERCALL_KAFL_RAX_ID			0x01f
++#define KVM_EXIT_KAFL_ACQUIRE			100
++#define KVM_EXIT_KAFL_GET_PAYLOAD		101
++#define KVM_EXIT_KAFL_GET_PROGRAM		102
++#define KVM_EXIT_KAFL_GET_ARGV		103
++#define KVM_EXIT_KAFL_RELEASE			104
++#define KVM_EXIT_KAFL_SUBMIT_CR3		105
++#define KVM_EXIT_KAFL_SUBMIT_PANIC	106
++#define KVM_EXIT_KAFL_SUBMIT_KASAN	107
++#define KVM_EXIT_KAFL_PANIC			108
++#define KVM_EXIT_KAFL_KASAN			109
++#define KVM_EXIT_KAFL_LOCK			110
++#define KVM_EXIT_KAFL_INFO			111
++#define KVM_EXIT_KAFL_NEXT_PAYLOAD	112
++#define KVM_EXIT_KAFL_DEBUG			113
++
+ /* For KVM_EXIT_INTERNAL_ERROR */
+ /* Emulate instruction failed. */
+ #define KVM_INTERNAL_ERROR_EMULATION	1
+@@ -2249,4 +2265,34 @@ struct kvm_s390_zpci_op {
+ /* flags for kvm_s390_zpci_op->u.reg_aen.flags */
+ #define KVM_S390_ZPCIOP_REGAEN_HOST    (1 << 0)
+ 
++/*
++ * ioctls for vmx_pt fds
++ */
++#define KVM_VMX_PT_SETUP_FD				_IO(KVMIO,	0xd0)			/* apply vmx_pt fd (via vcpu fd ioctl)*/
++#define KVM_VMX_PT_CONFIGURE_ADDR0		_IOW(KVMIO,	0xd1, __u64)	/* configure IP-filtering for addr0_a & addr0_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR1		_IOW(KVMIO,	0xd2, __u64)	/* configure IP-filtering for addr1_a & addr1_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR2		_IOW(KVMIO,	0xd3, __u64)	/* configure IP-filtering for addr2_a & addr2_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR3		_IOW(KVMIO,	0xd4, __u64)	/* configure IP-filtering for addr3_a & addr3_b */
++
++#define KVM_VMX_PT_CONFIGURE_CR3			_IOW(KVMIO,	0xd5, __u64)	/* setup CR3 filtering value */
++#define KVM_VMX_PT_ENABLE					_IO(KVMIO,	0xd6)			/* enable and lock configuration */ 
++#define KVM_VMX_PT_GET_TOPA_SIZE			_IOR(KVMIO,	0xd7, __u32)	/* get defined ToPA size */
++#define KVM_VMX_PT_DISABLE				_IO(KVMIO,	0xd8)			/* enable and lock configuration */ 
++#define KVM_VMX_PT_CHECK_TOPA_OVERFLOW	_IO(KVMIO,	0xd9)			/* check for ToPA overflow */
++
++#define KVM_VMX_PT_ENABLE_ADDR0			_IO(KVMIO,	0xaa)			/* enable IP-filtering for addr0 */
++#define KVM_VMX_PT_ENABLE_ADDR1			_IO(KVMIO,	0xab)			/* enable IP-filtering for addr1 */
++#define KVM_VMX_PT_ENABLE_ADDR2			_IO(KVMIO,	0xac)			/* enable IP-filtering for addr2 */
++#define KVM_VMX_PT_ENABLE_ADDR3			_IO(KVMIO,	0xad)			/* enable IP-filtering for addr3 */
++
++#define KVM_VMX_PT_DISABLE_ADDR0			_IO(KVMIO,	0xae)			/* disable IP-filtering for addr0 */
++#define KVM_VMX_PT_DISABLE_ADDR1			_IO(KVMIO,	0xaf)			/* disable IP-filtering for addr1 */
++#define KVM_VMX_PT_DISABLE_ADDR2			_IO(KVMIO,	0xe0)			/* disable IP-filtering for addr2 */
++#define KVM_VMX_PT_DISABLE_ADDR3			_IO(KVMIO,	0xe1)			/* disable IP-filtering for addr3 */
++
++#define KVM_VMX_PT_ENABLE_CR3				_IO(KVMIO,	0xe2)			/* enable CR3 filtering */
++#define KVM_VMX_PT_DISABLE_CR3			_IO(KVMIO,	0xe3)			/* disable CR3 filtering */
++
++#define KVM_VMX_PT_SUPPORTED				_IO(KVMIO,	0xe4)
++
+ #endif /* __LINUX_KVM_H */
+diff --git a/usermode_test/support_test.c b/usermode_test/support_test.c
+new file mode 100644
+index 000000000000..cdf80e223f01
+--- /dev/null
++++ b/usermode_test/support_test.c
+@@ -0,0 +1,59 @@
++/* 
++ * KVM-PT userspace support test program
++ * (c) Sergej Schumilo, 2016 <sergej@schumilo.de> 
++ * 
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include <err.h>
++#include <fcntl.h>
++#include <linux/kvm.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#define KVM_VMX_PT_SUPPORTED	_IO(KVMIO,	0xe4)
++
++int main(){
++	int kvm, ret;
++
++	kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
++	if (kvm == -1){
++		printf("ERROR: KVM is not loaded!\n");
++		exit(1);
++	} 
++
++	ret = ioctl(kvm, KVM_VMX_PT_SUPPORTED, NULL);
++	if (ret == -1){
++		printf("ERROR: KVM-PT is not loaded!\n");
++		exit(2);
++	}
++	if (ret == -2){
++		printf("ERROR: Intel PT is not supported on this CPU!\n");
++		exit(3);
++	}
++	printf("KVM-PT is ready!\n");
++	return 0;
++}
+diff --git a/usermode_test/test.c b/usermode_test/test.c
+new file mode 100644
+index 000000000000..6d0628ca1614
+--- /dev/null
++++ b/usermode_test/test.c
+@@ -0,0 +1,351 @@
++/* 
++ * vmx_pt userspace test program 
++ * (c) Sergej Schumilo, 2016 <sergej@schumilo.de> 
++ * 
++ * KVM Sample code for /dev/kvm API
++ *
++ * Copyright (c) 2015 Intel Corporation
++ * Author: Josh Triplett <josh@joshtriplett.org>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include <err.h>
++#include <fcntl.h>
++#include <linux/kvm.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#define KVM_VMX_PT_SETUP_FD					_IO(KVMIO,	0xd0)			/* apply vmx_pt fd (via vcpu fd ioctl)*/
++#define KVM_VMX_PT_CONFIGURE_ADDR0			_IOW(KVMIO,	0xd1, __u64)	/* configure IP-filtering for addr0_a & addr0_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR1			_IOW(KVMIO,	0xd2, __u64)	/* configure IP-filtering for addr1_a & addr1_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR2			_IOW(KVMIO,	0xd3, __u64)	/* configure IP-filtering for addr2_a & addr2_b */
++#define KVM_VMX_PT_CONFIGURE_ADDR3			_IOW(KVMIO,	0xd4, __u64)	/* configure IP-filtering for addr3_a & addr3_b */
++
++#define KVM_VMX_PT_CONFIGURE_CR3			_IOW(KVMIO,	0xd5, __u64)	/* setup CR3 filtering value */
++#define KVM_VMX_PT_ENABLE					_IO(KVMIO,	0xd6)			/* enable and lock configuration */ 
++#define KVM_VMX_PT_GET_TOPA_SIZE			_IOR(KVMIO,	0xd7, __u32)	/* get defined ToPA size */
++#define KVM_VMX_PT_DISABLE					_IO(KVMIO,	0xd8)			/* enable and lock configuration */ 
++#define KVM_VMX_PT_CHECK_TOPA_OVERFLOW		_IO(KVMIO,	0xd9)			/* check for ToPA overflow */
++
++#define KVM_VMX_PT_ENABLE_ADDR0				_IO(KVMIO,	0xaa)			/* enable IP-filtering for addr0 */
++#define KVM_VMX_PT_ENABLE_ADDR1				_IO(KVMIO,	0xab)			/* enable IP-filtering for addr1 */
++#define KVM_VMX_PT_ENABLE_ADDR2				_IO(KVMIO,	0xac)			/* enable IP-filtering for addr2 */
++#define KVM_VMX_PT_ENABLE_ADDR3				_IO(KVMIO,	0xad)			/* enable IP-filtering for addr3 */
++
++#define KVM_VMX_PT_DISABLE_ADDR0			_IO(KVMIO,	0xae)			/* disable IP-filtering for addr0 */
++#define KVM_VMX_PT_DISABLE_ADDR1			_IO(KVMIO,	0xaf)			/* disable IP-filtering for addr1 */
++#define KVM_VMX_PT_DISABLE_ADDR2			_IO(KVMIO,	0xe0)			/* disable IP-filtering for addr2 */
++#define KVM_VMX_PT_DISABLE_ADDR3			_IO(KVMIO,	0xe1)			/* disable IP-filtering for addr3 */
++
++#define KVM_VMX_PT_ENABLE_CR3				_IO(KVMIO,	0xe2)			/* enable CR3 filtering */
++#define KVM_VMX_PT_DISABLE_CR3				_IO(KVMIO,	0xe3)			/* disable CR3 filtering */
++
++#define KVM_VMX_PT_SUPPORTED				_IO(KVMIO,	0xe4)
++
++#define KVM_VMX_PT_CONFIGURE_HYPERCALL_HOOK	_IOW(KVMIO,	0xe5, __u64)	/* set address for hypercall hooks */
++
++struct vmx_pt_filter_iprs {
++	__u64 a;
++	__u64 b;
++};
++
++#define PAGE_SHIFT						12
++#define TOPA_MAIN_ORDER					7
++#define TOPA_FALLBACK_ORDER				0
++#define TOPA_MAIN_SIZE					((1 << TOPA_MAIN_ORDER)*(1 << PAGE_SHIFT))
++#define TOPA_FALLBACK_SIZE				((1 << TOPA_FALLBACK_ORDER)*(1 << PAGE_SHIFT))
++#define TOPA_SIZE 						(TOPA_MAIN_SIZE + TOPA_FALLBACK_SIZE)
++
++/* guest code sections */
++#define ENTRY_ADDR 0x1000
++#define SIZE (0x8 * 0x1000)
++
++#define NPAGES 1
++
++unsigned char *kadr;
++
++void dump(int bytes){
++	int i;
++	printf("Trace-Data size: %d\n", bytes);
++	fprintf(stdout, "\n%x\t", 0);
++	/* ugly code incoming */
++	for (int i= 0; i < bytes; i++){
++		fprintf(stdout, "%02x", kadr[i+7]);
++		fprintf(stdout, "%02x", kadr[i+6]); 
++		fprintf(stdout, "%02x", kadr[i+5]);
++		fprintf(stdout, "%02x", kadr[i+4]);
++		fprintf(stdout, "%02x", kadr[i+3]);
++		fprintf(stdout, "%02x", kadr[i+2]);
++		fprintf(stdout, "%02x", kadr[i+1]);
++		fprintf(stdout, "%02x", kadr[i]);
++		fprintf(stdout, " ");
++		i += 7;
++	
++		if (!((i+1)%16)){
++			fprintf(stdout, "\n%x\t", i+1);
++		}
++	}
++	fprintf(stdout, "\n");
++	printf("---------------------------\n");
++}
++
++int trace(void)
++{
++	int i;
++	int kvm, vmfd, vcpufd, vmx_pt_fd, ret;
++	const uint8_t code[] = {
++			0xba, 0xf8, 0x03,					/* <0x1000> mov $0x3f8, %dx.    */
++			0x00, 0xd8,       					/* <0x1003> add %bl, %al 		*/
++			0x04, '0',        					/* <0x1005> add $'0', %al		*/
++			0xee,             					/* <0x1007> out %al, (%dx)		*/
++			0xb0, '\n',       					/* <0x1008> mov $'\n', %al		*/
++			0xee,             					/* <0x100a> out %al, (%dx)		*/
++			0xea, 0x11, 0x10, 0x00, 0x00, 		/* <0x100b> far jmp to 0x1011	*/
++			0xf4,             					/* <0x1010> hlt					*/
++			0xb0, '*',        					/* <0x1011> mov $'\n', %al		*/
++			0x73, 0x01,							/* <0x1013> jnc +1				*/
++			0xee,             					/* <0x1015> out %al, (%dx)		*/
++			0xee,             					/* <0x1016> out %al, (%dx)		*/
++			0xee,             					/* <0x1017> out %al, (%dx)		*/
++			0xea, 0x10, 0x10, 0x00, 0x00, 		/* <0x1018> far jmp to 0x1010	*/
++	};
++	
++	uint8_t *mem;
++	struct kvm_sregs sregs;
++	size_t mmap_size;
++	struct kvm_run *run;
++	size_t bytes = 0;
++	struct vmx_pt_filter_iprs filter_iprs;
++
++	/* Create KVM fd */
++	kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
++	if (kvm == -1){
++		err(1, "/dev/kvm");
++	}
++
++
++	ret = ioctl(kvm, KVM_VMX_PT_SUPPORTED, NULL);
++	if (ret == -1){
++		printf("ERROR: vmx_pt is not loaded!\n");
++		exit(2);
++	}
++	if (ret == -2){
++		printf("ERROR: Intel PT is not supported on this CPU!\n");
++		exit(3);
++	}
++
++	/* Make sure we have the stable version of the API */
++	ret = ioctl(kvm, KVM_GET_API_VERSION, NULL);
++	if (ret == -1){
++		err(1, "KVM_GET_API_VERSION");
++	}
++	if (ret != 12){
++		errx(1, "KVM_GET_API_VERSION %d, expected 12", ret);
++	}
++
++	vmfd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
++	if (vmfd == -1){
++		err(1, "KVM_CREATE_VM");
++	}
++
++	/* Allocate one aligned page of guest memory to hold the code */
++	mem = mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (!mem){
++		err(1, "allocating guest memory");
++	}
++	memcpy(mem, code, sizeof(code));
++
++	/* Map it to the second page frame (to avoid the real-mode IDT at 0) */
++	struct kvm_userspace_memory_region region = {
++		.slot = 0,
++		.guest_phys_addr = ENTRY_ADDR,
++		.memory_size = SIZE,
++		.userspace_addr = (uint64_t)mem,
++	};
++
++	/* Setup executable memory region */
++	ret = ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &region);
++	if (ret == -1){
++		err(1, "KVM_SET_USER_MEMORY_REGION");
++	}
++
++	/* Create VCPU fd */
++	vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, (unsigned long)0);
++	if (vcpufd == -1){
++		err(1, "KVM_CREATE_VCPU");
++	}
++
++	/* Map the shared kvm_run structure and following data. */
++	ret = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL);
++	if (ret == -1){
++		err(1, "KVM_GET_VCPU_MMAP_SIZE");
++	}
++	mmap_size = ret;
++	if (mmap_size < sizeof(*run)){
++		errx(1, "KVM_GET_VCPU_MMAP_SIZE unexpectedly small");
++	}
++	run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpufd, 0);
++	if (!run){
++		err(1, "mmap vcpu");
++	}
++
++	/* Initialize CS to point at 0, via a read-modify-write of sregs. */
++	ret = ioctl(vcpufd, KVM_GET_SREGS, &sregs);
++	if (ret == -1){
++		err(1, "KVM_GET_SREGS");
++	}
++	sregs.cs.base = 0;
++	sregs.cs.selector = 0;
++	ret = ioctl(vcpufd, KVM_SET_SREGS, &sregs);
++	if (ret == -1){
++		err(1, "KVM_SET_SREGS");
++	}
++
++	/* Initialize registers: instruction pointer for our code, addends, and initial flags required by x86 architecture. */
++	struct kvm_regs regs = {
++		.rip = ENTRY_ADDR,
++		.rax = 2,
++		.rbx = 2,
++		.rflags = 0x2,
++	};
++	ret = ioctl(vcpufd, KVM_SET_REGS, &regs);
++	if (ret == -1){
++		err(1, "KVM_SET_REGS");
++	}
++
++	/* Get vmx_pt fd */
++	vmx_pt_fd = ioctl(vcpufd, KVM_VMX_PT_SETUP_FD, (unsigned long)0);
++	if (!(vmx_pt_fd == -1)){
++
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_GET_TOPA_SIZE, (unsigned long)0x0);
++		if (ret == -1){
++			err(1, "KVM_VMX_PT_GET_TOPA_SIZE");
++		}
++		printf("KVM_VMX_PT_GET_TOPA_SIZE: %d\n", ret);
++
++		/* Set up ToPA Base + Fallback region mapping */
++	   	kadr = mmap(0, ret, PROT_READ, MAP_SHARED, vmx_pt_fd, 0);
++		if (kadr == MAP_FAILED) { 
++			perror("mmap");
++			exit(-1);
++	   	}
++
++	   	filter_iprs.a = 0x1000;
++	   	filter_iprs.b = 0x100a;
++		
++		/* Set up ADDR0 IP filtering */
++	    ret = ioctl(vmx_pt_fd, KVM_VMX_PT_CONFIGURE_ADDR0, &filter_iprs);
++		if (ret == -1){
++			err(1, "KVM_VMX_PT_CONFIGURE_ADDR0");
++		}
++		
++		/* Enable ADDR0 IP filtering (trace only 0x1000 - 0x100a) */
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_ENABLE_ADDR0, (unsigned long)0);
++		if (ret == -1){
++			err(1, "KVM_VMX_PT_ENABLE_ADDR0");
++		}
++			
++		filter_iprs.a = 0x1017;
++	   	filter_iprs.b = 0x200a;
++
++		/* Set up ADDR1 IP filtering */
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_CONFIGURE_ADDR1, &filter_iprs);
++		if (ret == -1){
++				err(1, "KVM_VMX_PT_CONFIGURE_ADDR1");
++		}
++
++		/* Enable ADDR1 IP filtering (also enable tracing for 0x1017 - 0x200a) */
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_ENABLE_ADDR1, (unsigned long)0);
++		if (ret == -1){
++			err(1, "KVM_VMX_PT_ENABLE_ADDR1");
++		}
++		  
++		/* Configuration is ready ... Let's enable vmx_pt tracing */
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_ENABLE, (unsigned long)0);
++		if (ret == -1){
++				err(1, "KVM_VMX_PT_ENABLE");
++		}
++	}
++	else{
++	    printf("vmx_pt is not ready...\n");
++	    return 1; 
++	}
++
++	/* Repeatedly run code and handle VM exits. */
++	while (1) {
++
++		/* Execute code in guest mode */
++		ret = ioctl(vcpufd, KVM_RUN, NULL);
++		if (ret == -1)
++			err(1, "KVM_RUN");
++
++		switch (run->exit_reason) {
++			case KVM_EXIT_HLT:
++				puts("KVM_EXIT_HLT");
++
++		        /* Let's dump trace data for the last time */
++				bytes = ioctl(vmx_pt_fd, KVM_VMX_PT_DISABLE, (unsigned long)0);
++				if (bytes > 0){
++					dump(bytes);
++				}
++				return 0;
++
++			case KVM_EXIT_IO:
++				if (run->io.direction == KVM_EXIT_IO_OUT && run->io.size == 1 && run->io.port == 0x3f8 && run->io.count == 1){
++					printf("GUEST: ");
++					putchar(*(((char *)run) + run->io.data_offset));
++					printf("\n");
++				}
++				else{
++					errx(1, "unhandled KVM_EXIT_IO");
++				}
++				break;
++
++			case KVM_EXIT_FAIL_ENTRY:
++				errx(1, "KVM_EXIT_FAIL_ENTRY: hardware_entry_failure_reason = 0x%llx",
++					 (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
++
++			case KVM_EXIT_INTERNAL_ERROR:
++				errx(1, "KVM_EXIT_INTERNAL_ERROR: suberror = 0x%x", run->internal.suberror);
++
++			default:
++				errx(1, "exit_reason = 0x%x", run->exit_reason);
++		}
++	
++		/* If the ToPA base region is overflowed, this ioctl call will return the offset of the fallback region + ToPA base region size */
++		ret = ioctl(vmx_pt_fd, KVM_VMX_PT_CHECK_TOPA_OVERFLOW, (unsigned long)0);
++		if (ret){
++			printf("ToPA Overflow: %d", ret);
++			dump(ret);
++		}
++	}
++
++	return 0;
++}
++
++int main(){
++	trace();
++}
+-- 
+2.34.1
+
