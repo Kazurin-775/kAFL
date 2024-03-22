@@ -5,8 +5,8 @@ RUN sed -i 's/archive.ubuntu.com/cn.archive.ubuntu.com/' /etc/apt/sources.list &
     apt -y update && apt -y upgrade
 
 RUN apt -y install make gcc libcapstone-dev bc libssl-dev python-pip \
-    python-pygraphviz gnuplot ruby python libgtk2.0-dev libc6-dev flex && \
-    apt -y build-dep qemu-system-x86
+    python-pygraphviz gnuplot ruby python libgtk2.0-dev libc6-dev flex \
+    xdot qemu-utils && apt -y build-dep qemu-system-x86
 
 RUN pip install mmh3==2.5.1 lz4==2.2.1 psutil
 
