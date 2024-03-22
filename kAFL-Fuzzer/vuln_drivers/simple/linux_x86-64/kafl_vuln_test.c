@@ -18,14 +18,14 @@ ssize_t write_info(struct file *filp, const char __user *buff, size_t len, loff_
 
 struct proc_dir_entry *proc_file_entry;
 
-static const struct file_operations proc_file_fops = {
-	 .owner = THIS_MODULE,
-	 .write = write_info,
-	};
+static const struct proc_ops proc_ops = {
+	.proc_flags = 0,
+	.proc_write = write_info,
+};
 
 int init_mod( void )
 {
-	proc_file_entry = proc_create(NAME, 0666, NULL, &proc_file_fops);
+	proc_file_entry = proc_create(NAME, 0666, NULL, &proc_ops);
 	if(proc_file_entry == NULL)
 		return -ENOMEM;
 	return 0;
