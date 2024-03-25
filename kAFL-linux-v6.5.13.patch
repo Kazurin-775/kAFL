@@ -1,6 +1,6 @@
-From 29d6bac4343be8455f0496e75b1d0242799a1633 Mon Sep 17 00:00:00 2001
+From 0f548f25d4fdd9aa375829e9dfc1dd24c62a9c2c Mon Sep 17 00:00:00 2001
 From: Kazurin Nanako <71819243+Kazurin-775@users.noreply.github.com>
-Date: Thu, 21 Mar 2024 11:24:51 +0800
+Date: Mon, 25 Mar 2024 16:31:12 +0800
 Subject: Apply kAFL patches
 
 ---
@@ -14,11 +14,11 @@ Subject: Apply kAFL patches
  arch/x86/kvm/vmx/vmx.h             |  15 +-
  arch/x86/kvm/vmx/vmx_pt.c          | 865 +++++++++++++++++++++++++++++
  arch/x86/kvm/vmx/vmx_pt.h          |  21 +
- arch/x86/kvm/x86.c                 |  84 +++
+ arch/x86/kvm/x86.c                 |  82 +++
  include/uapi/linux/kvm.h           |  46 ++
  usermode_test/support_test.c       |  59 ++
  usermode_test/test.c               | 351 ++++++++++++
- 14 files changed, 1521 insertions(+), 6 deletions(-)
+ 14 files changed, 1519 insertions(+), 6 deletions(-)
  create mode 100644 arch/x86/kvm/vmx/vmx_pt.c
  create mode 100644 arch/x86/kvm/vmx/vmx_pt.h
  create mode 100644 usermode_test/support_test.c
@@ -1228,7 +1228,7 @@ index 000000000000..aa16b1395a63
 +
 +#endif
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index a5c8a01f7e7e..485883ce9373 100644
+index a5c8a01f7e7e..b026b8838e88 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -4788,6 +4788,12 @@ long kvm_arch_dev_ioctl(struct file *filp,
@@ -1257,14 +1257,13 @@ index a5c8a01f7e7e..485883ce9373 100644
  	default:
  		r = -EINVAL;
  	}
-@@ -9851,6 +9863,63 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+@@ -9851,6 +9863,62 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
  	}
  
  	if (static_call(kvm_x86_get_cpl)(vcpu) != 0) {
 +		/* kAFL Hypercall interface */
 +		#ifdef CONFIG_KVM_VMX_PT
 +		if (kvm_register_read(vcpu, VCPU_REGS_RAX) == HYPERCALL_KAFL_RAX_ID){
-+			ret = 0;
 +			switch(kvm_register_read(vcpu, VCPU_REGS_RBX)){
 +				case 0:  /* KAFL_GUEST_ACQUIRE */
 +					vcpu->run->exit_reason = KVM_EXIT_KAFL_ACQUIRE;
@@ -1312,21 +1311,20 @@ index a5c8a01f7e7e..485883ce9373 100644
 +					break;
 +				default:
 +					ret = -KVM_EPERM;
-+					break;
++					goto out;
 +			}
-+			goto out;
++			return 0;
 +		}
 +		#endif
 +
  		ret = -KVM_EPERM;
  		goto out;
  	}
-@@ -9913,6 +9982,21 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+@@ -9913,6 +9981,20 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
  		vcpu->arch.complete_userspace_io = complete_hypercall_exit;
  		return 0;
  	}
 +	case HYPERCALL_KAFL_RAX_ID: {
-+		ret = 0;
 +		switch(kvm_register_read(vcpu, VCPU_REGS_RBX)){
 +			case 8: /* PANIC */
 +				vcpu->run->exit_reason = KVM_EXIT_KAFL_PANIC;
@@ -1336,9 +1334,9 @@ index a5c8a01f7e7e..485883ce9373 100644
 +				break;
 +			default:
 +				ret = -KVM_EPERM;
-+				break;
++				goto out;
 +		}
-+		goto out;
++		return 0;
 +	}
  	default:
  		ret = -KVM_ENOSYS;
