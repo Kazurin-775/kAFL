@@ -1,6 +1,6 @@
-From 0f548f25d4fdd9aa375829e9dfc1dd24c62a9c2c Mon Sep 17 00:00:00 2001
+From 76deab7e7077271d7abd0dc9dbebe1b24cb7fc2d Mon Sep 17 00:00:00 2001
 From: Kazurin Nanako <71819243+Kazurin-775@users.noreply.github.com>
-Date: Mon, 25 Mar 2024 16:31:12 +0800
+Date: Tue, 26 Mar 2024 11:34:07 +0800
 Subject: Apply kAFL patches
 
 ---
@@ -14,11 +14,11 @@ Subject: Apply kAFL patches
  arch/x86/kvm/vmx/vmx.h             |  15 +-
  arch/x86/kvm/vmx/vmx_pt.c          | 865 +++++++++++++++++++++++++++++
  arch/x86/kvm/vmx/vmx_pt.h          |  21 +
- arch/x86/kvm/x86.c                 |  82 +++
+ arch/x86/kvm/x86.c                 |  96 ++++
  include/uapi/linux/kvm.h           |  46 ++
  usermode_test/support_test.c       |  59 ++
  usermode_test/test.c               | 351 ++++++++++++
- 14 files changed, 1519 insertions(+), 6 deletions(-)
+ 14 files changed, 1533 insertions(+), 6 deletions(-)
  create mode 100644 arch/x86/kvm/vmx/vmx_pt.c
  create mode 100644 arch/x86/kvm/vmx/vmx_pt.h
  create mode 100644 usermode_test/support_test.c
@@ -1228,7 +1228,7 @@ index 000000000000..aa16b1395a63
 +
 +#endif
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index a5c8a01f7e7e..b026b8838e88 100644
+index a5c8a01f7e7e..4d8f39c118b1 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -4788,6 +4788,12 @@ long kvm_arch_dev_ioctl(struct file *filp,
@@ -1257,7 +1257,7 @@ index a5c8a01f7e7e..b026b8838e88 100644
  	default:
  		r = -EINVAL;
  	}
-@@ -9851,6 +9863,62 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+@@ -9851,6 +9863,70 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
  	}
  
  	if (static_call(kvm_x86_get_cpl)(vcpu) != 0) {
@@ -1313,6 +1313,14 @@ index a5c8a01f7e7e..b026b8838e88 100644
 +					ret = -KVM_EPERM;
 +					goto out;
 +			}
++			/*
++			 * KAFL_GUEST_ACQUIRE needs to work across VM snapshots, so
++			 * we need to skip the `vmcall` instruction now (instead of
++			 * at the next VM entry)
++			 */
++			/* vcpu->arch.complete_userspace_io = complete_hypercall_exit; */
++			++vcpu->stat.hypercalls;
++			kvm_skip_emulated_instruction(vcpu);
 +			return 0;
 +		}
 +		#endif
@@ -1320,10 +1328,12 @@ index a5c8a01f7e7e..b026b8838e88 100644
  		ret = -KVM_EPERM;
  		goto out;
  	}
-@@ -9913,6 +9981,20 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+@@ -9913,6 +9989,26 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
  		vcpu->arch.complete_userspace_io = complete_hypercall_exit;
  		return 0;
  	}
++	/* kAFL Hypercall interface */
++	#ifdef CONFIG_KVM_VMX_PT
 +	case HYPERCALL_KAFL_RAX_ID: {
 +		switch(kvm_register_read(vcpu, VCPU_REGS_RBX)){
 +			case 8: /* PANIC */
@@ -1336,8 +1346,12 @@ index a5c8a01f7e7e..b026b8838e88 100644
 +				ret = -KVM_EPERM;
 +				goto out;
 +		}
++		/* vcpu->arch.complete_userspace_io = complete_hypercall_exit; */
++		++vcpu->stat.hypercalls;
++		kvm_skip_emulated_instruction(vcpu);
 +		return 0;
 +	}
++	#endif
  	default:
  		ret = -KVM_ENOSYS;
  		break;
