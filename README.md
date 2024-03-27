@@ -76,3 +76,21 @@ Refer to [README-old.md](./README-old.md) for information about how to:
 1. Build the kAFL loader agents and fuzz drivers
 1. Create VM snapshots ready for kAFL fuzzing
 1. Run the kAFL fuzzer on the snapshot
+
+Also check out the contents of the next section if you want to fuzz a modern OS with KPTI enabled.
+
+## ⚠️ Notes about KPTI and CR3 filtering
+
+kAFL utilizes **CR3 filtering** to limit the scope of tracing to a specific user-mode process, as stated in the original paper:
+
+> To limit trace data generation to one specific virtual memory address space, software can use the CR3 Filter. Intel PT will only produce trace data if the CR3 value matches the configured filter value. The CR3 register contains the pointer to the current page table. The value of the CR3 register can thus be used to filter code executed on behalf of a certain ring 3 process, even in ring 0 mode.
+
+However, this assumption is not true for modern OSes with KPTI (Kernel Page Table Isolation) enabled: the kernel creates 2 different page tables for each process, and switches between them when the system enters / exits kernel mode (i.e. ring 0).
+
+Since kAFL is unable to distinguish between user-mode and kernel-mode page tables, kAFL may **fail to capture any trace data** when fuzzing a guest OS with KPTI enabled, resulting in a **0/0 coverage bitmap** in the fuzzer. (You may confirm this issue by modifying the kernel source code to print the result of `vmx_pt_get_data_size2()`: this function produces correct results when running the unit test [KVM-PT/usermode_test/test.c](./KVM-PT/usermode_test/test.c), but not when running the fuzzer.)
+
+In order to work around this problem, you may have the following choices when fuzzing a KPTI-enabled guest OS:
+
+- Completely disable KPTI in the guest OS, e.g. by supplying `nopti` in the Linux kernel command line
+- Remove every call to `pt_set_cr3()` in QEMU-PT (there is only 1 call site)
+- Remove every call to `kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0)` in the fuzz drivers
