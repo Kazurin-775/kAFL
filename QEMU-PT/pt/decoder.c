@@ -260,6 +260,16 @@ static inline void tnt8_handler(decoder_t* self, uint8_t** p){
 #endif
 }
 
+static inline void cyc_handler(decoder_t* self, uint8_t** p) {
+	if (**p & 4) {
+		while (**p & 1)
+			(*p)++;
+		(*p)++;
+	} else {
+		(*p)++;
+	}
+}
+
 static inline void cbr_handler(decoder_t* self, uint8_t** p){
 	(*p) += PT_PKT_CBR_LEN;
 #ifdef DECODER_LOG
@@ -460,6 +470,12 @@ void decode_buffer(decoder_t* self, uint8_t* map, size_t len){
 				continue;
 			}
 			
+			/* CYC */
+			if ((byte0 & 3) == 3) {
+				cyc_handler(self, &p);
+				continue;
+			}
+
 			/* CBR */
 			if (*p == PT_PKT_GENERIC_BYTE0 && LEFT(PT_PKT_CBR_LEN) && p[1] == PT_PKT_CBR_BYTE1) {
 				cbr_handler(self, &p);
