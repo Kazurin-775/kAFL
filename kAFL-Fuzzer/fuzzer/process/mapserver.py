@@ -20,7 +20,8 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 import os
 import time
 
-import mmh3, base64, lz4
+import mmh3, base64
+import lz4.block
 import collections
 
 from fuzzer.communicator import send_msg, recv_msg, Communicator
