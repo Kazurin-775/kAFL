@@ -2,6 +2,14 @@ This is [kAFL](https://github.com/RUB-SysSec/kAFL) reworked to run on modern (20
 
 This work is done on a best-effort basis, so don't expect it to work without problems.
 
+## Screenshot
+
+The screenshot below is taken when fuzzing an [example vulnerable driver](./kAFL-Fuzzer/vuln_drivers/simple/linux_x86-64/kafl_vuln_test.c) installed on a Ubuntu 22.04 guest OS. The spec of the host CPU is `11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz`.
+
+Note that those "timeouts" in the screenshot are actually kernel heap corruption bugs, which are not treated as panics when KASAN is not enabled.
+
+![](./screenshot.png)
+
 ## Patch the host kernel
 
 kAFL requires a Linux kernel with KVM-PT patches running as the host OS. This repo provides a [patch for Linux kernel v6.5.13](./kAFL-linux-v6.5.13.patch) (which is the default kernel version for Ubuntu 23.10). If this kernel version differs from yours, you may encounter errors while applying the patch, and you may have to manually adjust the patch contents accordingly.
