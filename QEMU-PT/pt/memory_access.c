@@ -27,6 +27,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 bool read_virtual_memory(uint64_t address, uint8_t* data, uint32_t size, CPUState *cpu){
 	uint8_t tmp_buf[x86_64_PAGE_SIZE];
 	MemTxAttrs attrs;
+	MemTxResult res;
 	hwaddr phys_addr;
 	int asidx;
 	uint64_t counter, l;
@@ -47,9 +48,17 @@ bool read_virtual_memory(uint64_t address, uint8_t* data, uint32_t size, CPUStat
 		asidx = cpu_asidx_from_attrs(cpu, MEMTXATTRS_UNSPECIFIED);
 		attrs = MEMTXATTRS_UNSPECIFIED;
 		phys_addr = cpu_get_phys_page_attrs_debug(cpu, (address & x86_64_PAGE_MASK), &attrs);
+		if (phys_addr == -1) {
+			printf("Error: cannot read from unmapped GVA 0x%lx\n", address);
+			return false;
+		}
 		
 		phys_addr += (address & ~x86_64_PAGE_MASK);	
-		address_space_rw(cpu_get_address_space(cpu, asidx), phys_addr, MEMTXATTRS_UNSPECIFIED, tmp_buf, l, 0);
+		res = address_space_rw(cpu_get_address_space(cpu, asidx), phys_addr, MEMTXATTRS_UNSPECIFIED, tmp_buf, l, 0);
+		if (res != MEMTX_OK) {
+			printf("Error: failed to read from GVA 0x%lx (GPA 0x%lx)\n", address, phys_addr);
+			return false;
+		}
 		
 		memcpy(data+(i*x86_64_PAGE_SIZE), tmp_buf, l);
 		
@@ -85,14 +94,14 @@ bool write_virtual_memory(uint64_t address, uint8_t* data, uint32_t size, CPUSta
         phys_addr = cpu_get_phys_page_attrs_debug(cpu, (address & x86_64_PAGE_MASK), &attrs);
 
         if (phys_addr == -1){
-            printf("FAIL 1 (%lx)!\n", address);
+            printf("Error: cannot write to unmapped GVA 0x%lx\n", address);
             return false;
         }
         
         phys_addr += (address & ~x86_64_PAGE_MASK);   
         res = address_space_rw(cpu_get_address_space(cpu, asidx), phys_addr, MEMTXATTRS_UNSPECIFIED, data, l, true);
         if (res != MEMTX_OK){
-            printf("FAIL 1 (%lx)!\n", address);
+            printf("Error: failed to write to GVA 0x%lx (GPA 0x%lx)\n", address, phys_addr);
             return false;
         }   
 
