@@ -203,6 +203,7 @@ static inline uint64_t get_ip_val(unsigned char **pp, unsigned char *end, int le
 	}
 	if (len < 4) {
 		if (!LEFT(len)) {
+			puts("Warning: short read when parsing TIP.* packet");
 			*last_ip = 0;
 			return 0; /* XXX error */
 		}
@@ -211,7 +212,11 @@ static inline uint64_t get_ip_val(unsigned char **pp, unsigned char *end, int le
 			v = (v & ~(0xffffULL << shift)) | (b << shift);
 		}
 		v = ((int64_t)(v << (64 - 48))) >> (64 - 48); /* sign extension */
+	} else if (len == 6) {
+		v = *(uint64_t *)p;
+		p += 8;
 	} else {
+		printf("Warning: unrecognized TIP.* packet with IPBytes = %d\n", len);
 		return 0; /* XXX error */
 	}
 	*pp = p;
